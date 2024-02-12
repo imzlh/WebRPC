@@ -110,6 +110,10 @@ export default class RPCBaseline{
      */
     protected $eque:Array<string> = [];
 
+    /**
+     * 绑定一个WebSocket
+     * 在Web端强烈建议不要修改此项而是使用自带的连接管理
+     */
     set socket(socket:WebSocket){
 
         const handle = () => {
@@ -128,7 +132,6 @@ export default class RPCBaseline{
         // 处理字符串数据
         socket.onmessage = (data) => typeof data.data == 'string' && this.__accept(data.data);
     }
-
 
     protected __accept(str:string){
         try{
@@ -184,7 +187,7 @@ export default class RPCBaseline{
         }
     }
 
-    __random(){
+    protected __random(){
         let rd;
         do{
             rd = (Math.random() * 100000).toString(36);
@@ -193,6 +196,18 @@ export default class RPCBaseline{
         
     }
 
+    /**
+     * 向远程发送调用函数请求。
+     * 只能调用非pipe函数，否则会报错
+     * 
+     * @example <caption>简单的调用</caption>
+     * // expect: hello everyone
+     * await RPC.call('a.b.c.d.hello',['hello','everyone']);
+     * 
+     * @param func 调用的内容，一般是函数名
+     * @param args 参数，调用函数时会用到
+     * @returns 返回的内容
+     */
     call(func:string,args:Array<any> = []){
         const id = this.__random();
         this.__show({
@@ -211,6 +226,20 @@ export default class RPCBaseline{
         );
     }
 
+    /**
+     * 向远程发送一个操作变量请求
+     * 如果提供了第二个参数，则认为是赋值操作
+     * 这个函数不会报错，请放心使用
+     * 
+     * @example <caption>寄存一个变量</caption>
+     * const data = 'hello';
+     * RPC.query('test.temp',data);
+     * RPC.query('test').temp == data; // true
+     * 
+     * @param name 变量名
+     * @param value 赋值
+     * @returns 变量内容
+     */
     query(name:string,value?:any){
         const id  = this.__random();
         this.__show({
@@ -219,7 +248,7 @@ export default class RPCBaseline{
             var: value,
             id
         });
-        if(!value) return new Promise((rs,rj) => 
+        if(!value) return new Promise(rs => 
             this.$requests[id] = {
                 "clear": "once",
                 "handle": rs,
@@ -228,6 +257,22 @@ export default class RPCBaseline{
         );
     }
 
+    /**
+     * RPC3 双向Pipe请求
+     * 可以发送JSON可序列化的任何数据，包括复杂的Object对象，但是会有序列化反序列化的延迟
+     * 单个WebSocket连接理论上只要硬件和带宽充足理论上可以承载无限双向Pipe
+     * 
+     * ** 当关闭连接后会关闭对方的管道，所以循环时需要判断是否可写！**
+     * 
+     * @example <caption>pipe管道调用</caption>
+     * const pipe = _C.pipe('echo',[]);
+     * console.log(pipe); // {writeable: WritableStream ,readable: ReadableStream}
+     * // echo函数实现只需要一行：pipe.readable.pipeTo(pipe.writeable);
+     * 
+     * @param func 
+     * @param args 
+     * @returns 
+     */
     pipe(func:string,args:Array<any> = []){
         const id = this.__random(),
             pipe = this.__stream(id);
