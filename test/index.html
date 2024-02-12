@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Test+</title>
+        <link href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" rel="stylesheet">
+        <script type="module">
+            import RPC from '../browser';
+            import Env from '../env';
+            import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/+esm';
+            import { FitAddon } from 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/+esm'
+
+            window.onload = function(){
+                // 初始化
+                const rpc = globalThis.RPC = new RPC((location.protocol.endsWith('s:') ? 'wss://' : 'ws://') + location.host),
+                    elem = document.body,
+                    term = new Terminal({
+                        rendererType: "webGL",
+                    });
+                term.loadAddon(new FitAddon());
+                term.open(document.body);
+                term.write('\x1b[s\x1b[0;30H\x1b[41;37m 欢迎来到RPC展览 \x1b[0m\x1b[u');
+                // 定义全局RPC
+                globalThis.RPC = rpc;
+                // 让服务端初始化调用
+                rpc.call('initMe',['output']);
+                // 提供函数供服务端调用
+                Env.provide('output',function(data){
+                    term.write(data);
+                });
+                console.log('init.access RPC to send/receive data from peer.');
+            }
+        </script>
+        <style>
+            body{
+                height: 100vh;
+                margin: 0;
+
+                display: flex;
+                align-items: center;
+                justify-content: center;
+
+                background: radial-gradient(black, #e2e2e2);
+            }
+
+            body::before{
+                content: 'RPC远程调用测试';
+                position: fixed;
+                top: 0;
+                font-size: 2rem;
+            }
+        </style>
+    </head>
+    <body>
+        
+    </body>
+</html>
