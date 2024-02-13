@@ -34,7 +34,7 @@ Deno.serve(function(req){
     }
 });
 
-function eh(error:ErrorEvent){
+function eh(error:Event){
     error.preventDefault();
     console.error(error);
 }

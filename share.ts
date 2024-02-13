@@ -1,5 +1,4 @@
 import Env from "./env"
-import { ErrorTrace, parse_stack } from "./utils";
 
 interface Reject{
     type: 'reject',
@@ -37,6 +36,13 @@ interface Pipe{
     id: string
 }
 
+interface PCall{
+    type: 'pcall',
+    call: Array<Prepare>,
+    safe?: boolean,
+    id: string
+}
+
 type Handler = {
     clear: 'once' | 'never',
     id: string,
@@ -44,13 +50,93 @@ type Handler = {
     error?: (error:any) => void
 }
 
-export type RPCData = Reject | Resolve | Call | Var | Pipe;
+export type RPCData = Reject | Resolve | Call | Var | Pipe | PCall;
 
 export type RPCPipe = {readable: ReadableStream,writeable: WritableStream};
 
 export type RPCallback = Function & {
     pipe: boolean,
     once: boolean
+}
+
+export interface ErrorTrace {
+    line: number,
+    col: number,
+    func: string,
+    file: string
+}
+
+/**
+* 解析Error对象中追踪字符串
+* 自动隐藏Deno、WinB内部文件
+* 
+* @param stack Error内容
+* @returns 追踪数组
+*/
+export function parse_stack(stack: string) {
+    const data = stack.split('\n'),
+        trace: Array<ErrorTrace> = [];
+    data.shift();
+    for (const item of data) {
+        const data = item.match(/\s*at (?:(.+?) )?\((.+)\)\s*/i);
+        if (!data) continue;
+        const [, func, pos] = data,
+            [file, line, col] = _split(pos, ':', 3),
+            test = file.split(':');
+        // deno的ext
+        if (test.length > 0 && test[0] == 'ext') continue;
+        // import.meta
+        if(import.meta.url == file) continue;
+        trace.push({ file, func, line: parseInt(line), col: parseInt(col) });
+    }
+    return trace;
+}
+
+/**
+ * 从最后处开始分离字符串为数组
+ * @param str 字符串
+ * @param char 分离标志
+ * @param length 分离的次数
+ * @returns 分离结果
+ */
+function _split(str: string, char: string, length: number){
+    let pos1 = str.length, pos2;
+    const res = [];
+    for (let i = 0; i < length - 1; i++) {
+        pos2 = str.lastIndexOf(char, pos1 - 1);
+        res.unshift(str.substring(pos2 + char.length, pos1));
+        pos1 = pos2;
+    }
+    res.unshift(str.substring(0, pos2));
+    return res;
+}
+
+export class FunctionProxy{
+
+    readonly $parent;
+    readonly $key;
+    readonly pipe;
+    readonly once;
+
+    constructor(parent:Record<string,any>,key:string){
+        this.$parent = parent,this.$key = key;
+        const el = parent[key] as RPCallback;
+        this.pipe = el.pipe;
+        this.once = el.once;
+    }
+
+    set(data:any){
+        this.$parent[this.$key] = data;
+    }
+
+    get(){
+        return this.$parent[this.$key]()
+    }
+
+    apply(_self:any,data:Array<any>,force = false):any{
+        if(force) return this.$parent[this.$key].apply(_self ,data);
+        else return this.$parent[this.$key](...data);
+    }
 }
 
 /**
@@ -82,6 +168,41 @@ export class RPCError extends Error{
      */
     toString(){
         return this.stack;
+    }
+}
+
+type Prepare = {call: string,args: any};
+
+/**
+ * 准备调用函数构造方法，允许连续赋值
+ */
+class Prepared{
+
+    readonly $callback;
+    readonly $prepared:Array<Prepare> = [];
+
+    constructor(callback:(data:Array<Prepare>,pcall:boolean) => Promise<any>){
+        this.$callback = callback;
+    }
+
+    /**
+     * 继续调用，参考 `RPC.prepare()` 的JSDOC文档
+     * 
+     * @param call 调用的函数，允许 "&.func"
+     * @param args 参数，允许 "$[data]"
+     */
+    then(call:string,args:Array<any>){
+        this.$prepared.push({call,args});
+        return this;
+    }
+
+    /**
+     * 立即发送请求，返回最后一个函数的调用结果
+     * @param pcall 安全调用，不会报错
+     * @returns 结果
+     */
+    send(pcall = false){
+        return this.$callback(this.$prepared,pcall);
     }
 }
 
@@ -133,6 +254,13 @@ export default class RPCBaseline{
         socket.onmessage = (data) => typeof data.data == 'string' && this.__accept(data.data);
     }
 
+    /**
+     * 实例的运行环境，只读
+     */
+    get env(){
+        return this.$env;
+    }
+
     protected __accept(str:string){
         try{
             try{
@@ -161,6 +289,10 @@ export default class RPCBaseline{
                 case "pipe":
                     this._pipe(data);
                 break;
+
+                case "pcall":
+                    this._prepare(data);
+                break;
             }
         }catch(e){
             console.error(e);
@@ -187,13 +319,116 @@ export default class RPCBaseline{
         }
     }
 
+    protected _prepare(data:PCall){
+        const prepared = data.call,id = data.id,
+            preg1 = /$([0-9]+)?\[(.+)\]/g,
+            preg2 = /^\&([0-9]+)?(?:\.(.+))?$/;
+        let result:Array<Record<string,any>> = [];
+
+        // 根据索引找内容
+        function getElement(key:string,current:Record<string,any>){
+            if(!key) return current;
+
+            const path = key.split('.'),
+                last = path.at(-1) as string;
+            for (let i = 0; i < path.length-1; i++) {
+                const next = path[i];
+                if(current == undefined || typeof current != 'object')
+                    if(data.safe) return null;
+                    else throw new TypeError('Cannot read properties of '+(typeof current)+' (reading \''+next+'\')');
+                current = current[next];
+            }
+            if(!current || typeof current != 'object')
+                throw new TypeError('Object '+last+' not found.');
+            if(typeof current[last] == 'function')
+                return new FunctionProxy(current,last);
+            else return current[last];
+        }
+
+        // 解析字符串，支持插值、引用
+        function parseStr(str:string):any{
+            let target;
+            // 引用
+            if(preg2.test(str)){
+                const [,_id,path] = str.match(preg2) as RegExpMatchArray;
+                if(_id){
+                    if(_id in result)
+                        target = getElement(path,result[_id as any]);
+                    else
+                        throw new TypeError('result id#'+_id+' not exists.');
+                }else
+                    target = getElement(path,result.at(-1) || {});
+            // 插值
+            }else
+                target = str.replaceAll(preg1,function(_,data){
+                    const elem = getElement(data,result.at(-1) || {});
+                    return elem ? elem.toString() : '';
+                });
+            return target;
+        }
+
+        // 深度搜索
+        function tree(object:Record<string,any>){
+
+            const newData:Record<string,any> = {};
+
+            for (const key in object) {
+                // 私有属性
+                if (!Object.prototype.hasOwnProperty.call(object, key)) continue;
+
+                const element = object[key];
+                if(typeof element == 'string'){
+                    // 分析并替换
+                    return parseStr(element)
+                }else if(typeof element == 'object'){
+                    // 深度搜索
+                    newData[key] = tree(element);
+                }else{
+                    // 直接原样传递
+                    newData[key] = element;
+                }
+            }
+
+            return newData;
+        }
+
+        // 主程序
+        for (const call of prepared) {
+            let target:FunctionProxy = parseStr(call.call);
+            if(typeof target == 'string')
+                target = this.$env.get(target);
+            if(target instanceof FunctionProxy){
+                if(target.pipe)
+                    this.__reject('PipeOnly function is not allowed.Use call() instead.',id);
+                try{
+                    let arg = tree(call.args);
+                    if(typeof arg == 'object' && arg.constructor.name == 'Object')
+                            arg = Object.values(arg);
+                    else
+                        arg = [arg];
+                    result.push(target.apply(this,arg));
+                }catch(e){
+                    // 安全调用不会报错
+                    if(!data.safe) this.__reject(e,id);
+                    result.push({});
+                }
+            }else this.__reject(call.args + ' is not callable',id);
+        }
+
+        // 返回结果
+        this.__show({
+            type: 'resolve',
+            id,
+            data: result.at(-1)
+        });
+    }
+
     protected __random(){
         let rd;
         do{
             rd = (Math.random() * 100000).toString(36);
         }while(rd in this.$requests);
         return rd;
-        
     }
 
     /**
@@ -287,10 +522,59 @@ export default class RPCBaseline{
     }
 
     /**
+     * RPC3 扩展 连续赋值调用
+     * 可以让函数返回值立即用于调用其他函数
+     * 
+     * 虽然这是一个实验性的功能，但是很好用！
+     * 
+     * 在任何地方，只需要以 `$[a.b.c]` 即可插值，如
+     * ```js
+     * // 假设1返回值是 ['Good morning!','zlh',{a:1,b:{c:'Hello again'}}]
+     * "$[1]hello,im$[2]"   // 在Array返回值中提取
+     * "&.3.b"              // 此处的&表示引用，其指向内容 可以为任何值，包括Object
+     * "$[3.b]/"            // 此时由于RPC调用.toString()方法，变成了[Object object]/
+     * "$[4.b]/"            // Uncaught TypeError，如果设置了safeMode则不插入任何值
+     * ```
+     * 但是我们不推荐复杂的Object传入，开销很大
+     * 
+     * @example <caption>将文件上传到example.com</caption>
+     * // 需要将Deno和fetch对象暴露，即Env.provide(...);
+     * RPC.prepare('Deno.open', ['/demo.mp4',{read: true,write: false}])
+     *      .then('fetch',[{
+     *           body: "&.readable",   // 这个地方使用了引用
+     *           method: 'POST',
+     *           headers: {
+     *               'Content-Type': 'video/mpeg4'
+     *           }
+     *       }])
+     *       // &表示对上一个结果的引用，只限于参数1中
+     *       .then('&.json',[])
+     *       // 使用自带的函数echo，回显结果
+     *       .then('echo',"state: $[code]",true);
+     */
+    prepare(name:string,args:Array<any> = []){
+        const id = this.__random();
+        return new Prepared((call,safe) => new Promise((rs,rj) => {
+            this.__show({
+                type: 'pcall',
+                call,
+                id,
+                safe
+            })
+            this.$requests[id] = {
+                "clear": "once",
+                "handle": rs,
+                "error": rj,
+                id
+            }
+        })).then(name,args);
+    }
+
+    /**
      * 发送给对方
      * @param data 发送给对方的数据
      */
-    protected async __show(data:RPCData):Promise<void>{
+    protected __show(data:RPCData):void{
         const str = JSON.stringify(data);
 
         // 删除handle
@@ -303,12 +587,12 @@ export default class RPCBaseline{
     }
 
     protected async _call(data:Call){
-        const func:RPCallback = this.$env.get(data.name);
-        if(typeof func != 'function' || func.pipe) 
+        const func:FunctionProxy = this.$env.get(data.name);
+        if(!(func instanceof FunctionProxy) || func.pipe) 
             return this.__reject(new TypeError( data.name+' is not callable' ),data.id);
 
         try{
-            const result = await func.apply(this,data.args);
+            const result = await (func as any).apply(this,data.args,true);
             if(data.id) this.__show({
                 type: 'resolve',
                 data: result,

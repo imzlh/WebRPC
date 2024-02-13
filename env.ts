@@ -1,4 +1,4 @@
-import RPCBaseline, { RPCallback } from "./share";
+import RPCBaseline, { RPCallback, FunctionProxy } from "./share";
 
 type TYPE = {
     "string": string,
@@ -21,13 +21,18 @@ export default class Env{
     protected $data:Record<string,any> = {};
 
     static _get(name:string,current:Record<string,any>):any{
-        const path = name.split('.');
-        for (let i = 0; i < path.length; i++) {
+        const path = name.split('.'),
+            last = path.at(-1) as string;
+        for (let i = 0; i < path.length-1; i++) {
             const next = path[i];
             if(!(next in current)) return null;
             current = current[next];
         }
-        return current;
+        if(typeof current != 'object')
+            throw new TypeError('Object '+last+' not found.');
+        if(typeof current[last] == 'function')
+            return new FunctionProxy(current,last);
+        else return current[last];
     }
 
     static _set(name:string,current:Record<string,any>,value:any){

@@ -27,6 +27,8 @@
                 Env.provide('output',function(data){
                     term.write(data);
                 });
+                // 向服务端暴露document
+                Env.provide('document',document);
                 console.log('init.access RPC to send/receive data from peer.');
             }
         </script>
@@ -47,6 +49,12 @@
                 position: fixed;
                 top: 0;
                 font-size: 2rem;
+            }
+
+            .float-bottom {
+                position: fixed;
+                bottom: 0;
+                color: #53e58c;
             }
         </style>
     </head>
