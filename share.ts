@@ -1,4 +1,13 @@
-import Env from "./env"
+/**
+ * WebRPC
+ * 基于WebSocket协议的双向远程调用的JS框架
+ * Copyright(C) 2024 izGroup
+ * 
+ * @version 1.2
+ * @author iz
+ * @link https://webrpc.imzlh.top/
+ * @license MIT
+ */
 
 interface Reject{
     type: 'reject',
@@ -21,10 +30,19 @@ interface Call{
     id: string
 }
 
+type TYPE = {
+    "string": string,
+    "number": number,
+    "boolean": boolean,
+    "undefined": undefined,
+    "object": object & Record<string,any>
+};
+
 interface Var{
     type: 'var',
     var: string,
     data?: string,
+    check?: keyof TYPE,
     id: string
 }
 
@@ -168,6 +186,60 @@ export class RPCError extends Error{
      */
     toString(){
         return this.stack;
+    }
+}
+
+export class Env{
+
+    /**
+     * 全局作用域
+     */
+    static $global:Record<string,any> = {};
+
+    /**
+     * 单个请求作用域
+     */
+    protected $data:Record<string,any> = {};
+
+    static _get(name:string,current:Record<string,any>):any{
+        const path = name.split('.'),
+            last = path.at(-1) as string;
+        for (let i = 0; i < path.length-1; i++) {
+            const next = path[i];
+            if(!(next in current)) return null;
+            current = current[next];
+        }
+        if(typeof current != 'object')
+            throw new TypeError('Object '+last+' not found.');
+        if(typeof current[last] == 'function')
+            return new FunctionProxy(current,last);
+        else return current[last];
+    }
+
+    static _set(name:string,current:Record<string,any>,value:any){
+        const path = name.split('.');
+        for (let i = 0; i < path.length-1; i++) {
+            const next = path[i];
+            if(!(next in current)) current[next] = {};
+            current = current[next];
+        }
+        current[path.at(-1) as string] = value;
+    }
+
+    static provide(name:string,func:((this:RPCBaseline,...data:Array<any>) => void),opt:{
+        pipe?: boolean,
+        once?: boolean
+    } = {}){
+        this._set(name,this.$global,func);
+        (<any>func as RPCallback).pipe = opt.pipe || false,(<any>func as RPCallback).once = opt.once || false;
+    }
+
+    set(name:string,value:any):void{
+        Env._set(name,this.$data,value);
+    }
+
+    get(name:string){
+        return Env._get(name,this.$data) || Env._get(name,Env.$global);
     }
 }
 
@@ -435,6 +507,9 @@ export default class RPCBaseline{
      * 向远程发送调用函数请求。
      * 只能调用非pipe函数，否则会报错
      * 
+     * 如果抛出错误，将传递并抛出RPCError
+     * 大部分报错内容会直接传递，做到好像真的是本地调用
+     * 
      * @example <caption>简单的调用</caption>
      * // expect: hello everyone
      * await RPC.call('a.b.c.d.hello',['hello','everyone']);
@@ -464,32 +539,39 @@ export default class RPCBaseline{
     /**
      * 向远程发送一个操作变量请求
      * 如果提供了第二个参数，则认为是赋值操作
+     * 
      * 这个函数不会报错，请放心使用
+     * 
+     * 类型检查提供了简易的方法在对方发送前判断类型
+     * 比如需要一个Boolean却返回了一个超大的Object，这个方法就十分有用
      * 
      * @example <caption>寄存一个变量</caption>
      * const data = 'hello';
-     * RPC.query('test.temp',data);
-     * RPC.query('test').temp == data; // true
+     * await RPC.query('test.temp',data);
+     * await RPC.query('test').temp == data;   // true
+     * await RPC.query('test',null,'boolean'); // null
      * 
      * @param name 变量名
      * @param value 赋值
+     * @param check 类型检查
      * @returns 变量内容
      */
-    query(name:string,value?:any){
+    query<T extends keyof TYPE>(name:string,value?:any,check?:T):Promise<TYPE[T] | null>{
         const id  = this.__random();
         this.__show({
             type: 'var',
             data: value,
             var: value,
+            check,
             id
         });
-        if(!value) return new Promise(rs => 
-            this.$requests[id] = {
+        return new Promise(rs => 
+            value ? this.$requests[id] = {
                 "clear": "once",
                 "handle": rs,
                 id
-            }
-        );
+            } : rs(null)
+        ) as any;
     }
 
     /**
@@ -682,10 +764,15 @@ export default class RPCBaseline{
         if(typeof data.var != 'string')
             return this.__reject(new TypeError( 'invalid data found.' ),data.id);
         if(data.data) this.$env.set(data.var, data.data);
-        else this.__show({
-            type: 'resolve',
-            data: this.$env.get(data.var),
-            id: data.id
-        });
+        else {
+            let result = this.$env.get(data.var);
+            if(data.check && typeof result != data.check)
+                result = null;
+            this.__show({
+                type: 'resolve',
+                data: result,
+                id: data.id
+            });
+        }
     }
 }
